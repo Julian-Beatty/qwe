@@ -16,7 +16,7 @@ from .postprocess.checks import (
 from .postprocess.rnd import (
     SafetyClipConfig,
     breeden_litzenberger_pdf,
-    apply_safety_clip_surface,
+    apply_safety_clip_surface, strike_rnd_to_return_density
 )
 
 from .postprocess.iv import (
@@ -184,7 +184,7 @@ class GlobalSurfacePricer:
         compute_iv: bool = False,
         compute_cdf: bool = False,
         compute_moments: bool = False,
-        compute_obs_reprice: bool = False,
+        compute_obs_reprice: bool = True,
         moments_cfg: Optional[MomentsConfig] = None,
         compute_delta: bool = False,
         iv_cfg: Optional[IVConfig] = None,
@@ -256,6 +256,18 @@ class GlobalSurfacePricer:
                 "any_used": bool(any(d.get("used", False) for d in clip_info)),
                 "per_row": clip_info,
             }
+            
+            # --- log-return RND surface (same rows as T_grid) ---
+            r_grid, rnd_lr = strike_rnd_to_return_density(
+                out["rnd_surface"],      # use clipped surface
+                K_grid=K_grid,
+                S0=float(day.S0),
+                return_type="log",
+                normalize=True,
+            )
+
+            out["rnd_lr_grid"] = np.asarray(r_grid, float)           # x-axis for lr density
+            out["rnd_lr_surface"] = np.asarray(rnd_lr, float)        # q_r(r) surface
 
             if compute_moments:
                 cfg_m = moments_cfg if moments_cfg is not None else MomentsConfig(

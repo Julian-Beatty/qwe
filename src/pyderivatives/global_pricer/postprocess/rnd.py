@@ -183,3 +183,42 @@ def apply_safety_clip_surface(
         out[i, :] = qi
         infos.append(info)
     return out, infos
+def strike_rnd_to_return_density(
+    qS: np.ndarray,
+    *,
+    K_grid: np.ndarray,
+    S0: float,
+    return_type: str = "log",   # "log" or "gross"
+    normalize: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    qS = np.asarray(qS, float)
+    K = np.asarray(K_grid, float).ravel()
+
+    if np.any(K <= 0):
+        raise ValueError("K_grid must be strictly positive.")
+    if qS.shape[-1] != K.size:
+        raise ValueError("Last dimension of qS must match len(K_grid).")
+
+    S0 = float(S0)
+
+    if return_type == "log":
+        grid = np.log(K / S0)          # r grid
+        jac = S0 * np.exp(grid)        # dS/dr
+        q_ret = qS * jac
+    elif return_type == "gross":
+        grid = K / S0                  # R grid
+        jac = S0                       # dS/dR
+        q_ret = qS * jac
+    else:
+        raise ValueError("return_type must be 'log' or 'gross'")
+
+    if normalize:
+        if q_ret.ndim == 1:
+            Z = np.trapz(q_ret, grid)
+            q_ret = q_ret / Z
+        else:
+            Z = np.trapz(q_ret, grid, axis=1).reshape(-1, 1)
+            q_ret = q_ret / Z
+
+    return grid, q_ret
+

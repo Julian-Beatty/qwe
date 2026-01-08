@@ -299,6 +299,11 @@ def evaluate_anchor_surfaces_with_theta_master(
     If safety_clip.enabled=True, we post-process pR_surface[T,:] by clipping from
     the mode outward and renormalizing each maturity slice. Moments are computed
     from the *clipped* physical density.
+
+    Returns both:
+      - strike-space densities (qK_surface, pK_surface, mK_surface)
+      - gross-return densities (qR_surface, pR_surface)
+      - log-return densities (fQ_r_surface, fP_r_surface)
     """
     T_grid = np.asarray(anchor_dict["T_grid"], float).ravel()
     K_grid = np.asarray(anchor_dict["K_grid"], float).ravel()
@@ -308,14 +313,19 @@ def evaluate_anchor_surfaces_with_theta_master(
     r_rf = float(anchor_dict.get("r", 0.0))
 
     r_lo, r_hi = eval_spec.r_bounds
-    r_common = np.linspace(r_lo, r_hi, eval_spec.r_grid_size)
+    r_common = np.linspace(r_lo, r_hi, int(eval_spec.r_grid_size))
     R_common = np.exp(r_common)
 
     nT = T_grid.size
-    qR_surf = np.full((nT, r_common.size), np.nan)
-    pR_surf = np.full_like(qR_surf, np.nan)
-    M_surf  = np.full_like(qR_surf, np.nan)
-    RRA_surf= np.full_like(qR_surf, np.nan)
+    nR = r_common.size
+
+    # --- surfaces on r-grid (common) ---
+    qR_surf  = np.full((nT, nR), np.nan)
+    pR_surf  = np.full((nT, nR), np.nan)
+    fQ_surf  = np.full((nT, nR), np.nan)   # log-return RND  f_Q(r)
+    fP_surf  = np.full((nT, nR), np.nan)   # log-return phys f_P(r)
+    M_surf   = np.full((nT, nR), np.nan)
+    RRA_surf = np.full((nT, nR), np.nan)
 
     # Build fQ(r) from q(K) row by row
     for j in range(nT):
@@ -331,13 +341,18 @@ def evaluate_anchor_surfaces_with_theta_master(
 
         K2 = K[mask]
         qK2 = qK_row[mask]
+
+        # log-return grid implied by available strikes
         rK = np.log(K2 / S0)
         Rk = np.exp(rK)
 
-        # q_R(R)=q_K(K)*S0 ; fQ(r)=q_R(R)*R
+        # ---- risk-neutral log-return density f_Q(r) ----
+        # q_R(R) = q_K(K)*S0  and  f_Q(r) = q_R(R)*R
+        # => f_Q(r) = q_K(S0*R) * S0 * R
         fQ = (qK2 * S0) * Rk
         fQ_grid = np.interp(r_common, rK, fQ, left=0.0, right=0.0)
 
+        # ---- physical log-return density f_P(r) via weighting ----
         g = g_r_sigma(r_common, sigma, theta_j, N=theta_spec.N, Ksig=theta_spec.Ksig)
 
         w = fQ_grid * np.exp(-g)
@@ -352,7 +367,8 @@ def evaluate_anchor_surfaces_with_theta_master(
         delta = np.log(mass)
         M_grid = np.exp(delta + g)
 
-        # Convert densities from r to R: f_R(R)=f_r(r)/R
+        # ---- convert log-return densities to gross-return densities ----
+        # f_R(R) = f_r(r) / R
         qR = fQ_grid / R_common
         pR = fP_grid / R_common
 
@@ -361,33 +377,56 @@ def evaluate_anchor_surfaces_with_theta_master(
             pR = _safety_clip_from_mode(pR, floor=float(getattr(safety_clip, "floor", 0.0)))
             pR = _renormalize_density_on_grid(R_common, pR)
 
-        qR_surf[j, :] = qR
-        pR_surf[j, :] = pR
-        M_surf[j, :]  = M_grid
+            # keep log-return physical density consistent with clipped pR:
+            # fP(r) = pR(R) * R
+            fP_grid = pR * R_common
+
+        # ---- store surfaces ----
+        qR_surf[j, :]  = qR
+        pR_surf[j, :]  = pR
+        fQ_surf[j, :]  = fQ_grid
+        fP_surf[j, :]  = fP_grid
+        M_surf[j, :]   = M_grid
 
         # Relative risk aversion proxy often computed from log M slope in r:
         # RRA(R) = - d log M / d log R = - d log M / dr
         dlogM_dr = np.gradient(np.log(np.maximum(M_grid, 1e-300)), r_common)
         RRA_surf[j, :] = -dlogM_dr
+
+    # ---- derived strike-space surfaces on common grid ----
     K_common = S0 * R_common
-    
+
     qK_surface = qR_surf / S0
     pK_surface = pR_surf / S0
     mK_surface = qK_surface / np.maximum(pK_surface, 1e-300)
-    
+
+    # moments want pr_surface on r-grid: pr(r) = pR(R) * R
     pr_surf = pR_surf * R_common[None, :]
     moments_df = physical_moments_table(T_grid=T_grid, r_common=r_common, pr_surface=pr_surf)
-    dict_result={
+
+    dict_result = {
         "T_anchor": T_grid,
         "R_common": R_common,
         "r_common": r_common,
+        "K_common": K_common,
         "sigma_value": sigma,
         "anchor_surfaces": {
+            # gross-return densities
             "qR_surface": qR_surf,
             "pR_surface": pR_surf,
+
+            # log-return densities (NEW)
+            "fQ_r_surface": fQ_surf,   # risk-neutral log-return density
+            "fP_r_surface": fP_surf,   # physical log-return density
+
+            # pricing kernel objects
             "M_surface": M_surf,
             "RRA_surface": RRA_surf,
-            
+
+            # strike densities on the same common grid
+            "qK_surface": qK_surface,
+            "pK_surface": pK_surface,
+            "mK_surface": mK_surface,
         },
         "physical_moments_table": moments_df,
         "meta": {"S0": S0, "r": r_rf},
@@ -396,10 +435,5 @@ def evaluate_anchor_surfaces_with_theta_master(
             "floor": float(getattr(safety_clip, "floor", 0.0)) if safety_clip is not None else 0.0,
         },
     }
-
-    dict_result["K_common"] = K_common
-    dict_result["anchor_surfaces"]["qK_surface"] = qK_surface
-    dict_result["anchor_surfaces"]["pK_surface"] = pK_surface
-    dict_result["anchor_surfaces"]["mK_surface"] = mK_surface
 
     return dict_result

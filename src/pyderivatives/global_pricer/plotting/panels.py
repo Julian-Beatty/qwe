@@ -78,7 +78,7 @@ def call_panels(
     C_obs = np.asarray(day.C_obs, float).ravel()
     m = (
         np.isfinite(K_obs) & np.isfinite(T_obs) & np.isfinite(C_obs)
-        & (K_obs > 0) & (T_obs > 0) & (C_obs >= 0)
+        & (K_obs > 0) & (T_obs >= 0) & (C_obs >= 0)
     )
     K_obs, T_obs, C_obs = K_obs[m], T_obs[m], C_obs[m]
     if K_obs.size == 0:
@@ -194,37 +194,61 @@ def iv_panels(
     *,
     n_panels: int = 6,
     title: str = "IV Panels",
-    # ---- NEW ----
+    # ---- layout ----
     panel_shape: tuple[int, int] | None = None,   # e.g. (3,2); default keeps old behavior
     save: str | None = None,
     dpi: int = 300,
     show: bool = True,
+    # ---- NEW: x-axis / bounds ----
+    x_axis: str = "K",                            # {"K","R","r"} strike / gross return / log return
+    x_bounds: tuple[float, float] | None = None,  # bounds in chosen x-axis units
+    spot: float | None = None,                    # S0; required for x_axis in {"R","r"} unless in res
 ):
     """
-    Panel plots of IV(K) across maturities.
+    Panel plots of IV across maturities.
 
     Requires:
       res["iv_surface"] OR res["vol_surface"]
       res["K_grid"], res["T_grid"]
+
+    x_axis:
+      "K": x = K (strike)
+      "R": x = R = K/S0 (gross return / moneyness)
+      "r": x = r = log(K/S0) (log return)
+
+    x_bounds are applied in the chosen x units.
+
+    Note: For x_axis in {"R","r"} spot/S0 must be available (passed or in res).
     """
     import numpy as np
     import matplotlib.pyplot as plt
     from pathlib import Path
 
+    # ---- load surface ----
     if "iv_surface" in res:
         iv = np.asarray(res["iv_surface"], float)
     elif "vol_surface" in res:
         iv = np.asarray(res["vol_surface"], float)
     else:
-        raise KeyError(
-            "Missing iv surface. Expected res['iv_surface'] or res['vol_surface']."
-        )
+        raise KeyError("Missing iv surface. Expected res['iv_surface'] or res['vol_surface'].")
 
     K_grid = np.asarray(res["K_grid"], float).ravel()
     T_grid = np.asarray(res["T_grid"], float).ravel()
 
     if iv.shape != (T_grid.size, K_grid.size):
         raise ValueError("IV surface must have shape (len(T_grid), len(K_grid)).")
+
+    # ---- spot/S0 ----
+    if spot is None:
+        spot = res.get("S0", None) or res.get("s0", None)
+    spot = float(spot) if spot is not None else None
+
+    x_axis = str(x_axis).strip()
+    if x_axis not in {"K", "R", "r"}:
+        raise ValueError("x_axis must be one of {'K','R','r'}.")
+
+    if x_axis in {"R", "r"} and spot is None:
+        raise ValueError("spot/S0 is required when x_axis is 'R' or 'r'.")
 
     # -------------------------
     # pick maturities
@@ -233,7 +257,40 @@ def iv_panels(
     n_panels_actual = int(idxT.size)
 
     # -------------------------
-    # NEW: panel layout
+    # NEW: x-mask from bounds
+    # -------------------------
+    if x_bounds is None:
+        k_mask = np.isfinite(K_grid)
+    else:
+        lo, hi = float(x_bounds[0]), float(x_bounds[1])
+        if lo >= hi:
+            raise ValueError("x_bounds must be (lo, hi) with lo < hi.")
+
+        if x_axis == "K":
+            k_mask = (K_grid >= lo) & (K_grid <= hi)
+        elif x_axis == "R":
+            k_mask = (K_grid >= lo * spot) & (K_grid <= hi * spot)
+        else:  # x_axis == "r"
+            k_mask = (K_grid >= spot * np.exp(lo)) & (K_grid <= spot * np.exp(hi))
+
+    if not np.any(k_mask):
+        raise ValueError("x_bounds produced an empty plotting window on K_grid.")
+
+    K_plot = K_grid[k_mask]
+
+    # ---- x for plotting ----
+    if x_axis == "K":
+        x_plot = K_plot
+        xlabel = "Strike K"
+    elif x_axis == "R":
+        x_plot = K_plot / spot
+        xlabel = "Gross return R = K/S0"
+    else:
+        x_plot = np.log(K_plot / spot)
+        xlabel = "Log return r = log(K/S0)"
+
+    # -------------------------
+    # panel layout
     # -------------------------
     if panel_shape is None:
         # original behavior
@@ -243,29 +300,26 @@ def iv_panels(
         nrows, ncols = int(panel_shape[0]), int(panel_shape[1])
         if nrows * ncols < n_panels_actual:
             raise ValueError(
-                f"panel_shape={panel_shape} has {nrows*ncols} slots, "
-                f"but need {n_panels_actual}."
+                f"panel_shape={panel_shape} has {nrows*ncols} slots, but need {n_panels_actual}."
             )
 
         fig_h = max(4.0, 2.2 * nrows)
         fig_w = 8.5 * ncols
-        fig, axes = plt.subplots(
-            nrows=nrows,
-            ncols=ncols,
-            figsize=(fig_w, fig_h),
-            sharex=True,
-        )
+        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(fig_w, fig_h), sharex=True)
         axes = np.atleast_1d(axes).ravel()
 
     # -------------------------
     # plot
     # -------------------------
     for ax, j in zip(axes[:n_panels_actual], idxT):
-        ax.plot(K_grid, iv[j, :], linewidth=2.0)
+        ax.plot(x_plot, iv[j, k_mask], linewidth=2.0)
         ax.set_title(f"T = {float(T_grid[j]):.4g}")
-        ax.set_xlabel("Strike K")
+        ax.set_xlabel(xlabel)
         ax.set_ylabel("Implied vol")
         ax.grid(True, alpha=0.25)
+
+        # x-limits in chosen units
+        ax.set_xlim(float(x_plot.min()), float(x_plot.max()))
 
     # Turn off unused panels
     for ax in axes[n_panels_actual:]:
@@ -290,6 +344,7 @@ def iv_panels(
 
 
 
+
 # -------------------------
 # 3) RND panels
 # -------------------------
@@ -297,7 +352,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Optional, Union
 from pathlib import Path
-
 def rnd_panels(
     res: dict,
     *,
@@ -309,13 +363,29 @@ def rnd_panels(
     spot: Optional[float] = None,
     show_spot: bool = True,
     spot_label: str = "Spot",
-    # ---- NEW ----
+    # --- layout ---
     panel_shape: tuple[int, int] | None = None,   # e.g. (3,2); default => stacked (n,1)
     save: Optional[Union[str, Path]] = None,
     dpi: int = 200,
     legend_loc: str = "upper right",
     figsize_per_panel: float = 2.2,
+    # ---- NEW: x-axis / bounds ----
+    x_axis: str = "K",                            # {"K","R","r"}  strike / gross return / log return
+    x_bounds: tuple[float, float] | None = None,  # bounds in chosen x_axis units
 ):
+    """
+    Plot RND panels with optional x-axis transform:
+
+    x_axis="K": x = K (strike)
+    x_axis="R": x = R = K / S0 (gross return / moneyness)
+    x_axis="r": x = r = log(K / S0) (log return)
+
+    Notes:
+    - When using x_axis in {"R","r"}, spot (S0) must be available.
+    - This function plots the same y-values (q on K-grid). It does not apply Jacobian
+      to convert to a density in R or r. If you want a true density on R or r, say so
+      and I’ll add the Jacobian option.
+    """
     if "rnd_surface" not in res:
         raise KeyError("Missing RND. Expected res['rnd_surface'].")
 
@@ -328,22 +398,7 @@ def rnd_panels(
     if K_grid.size < 3:
         raise ValueError("K_grid too small to plot meaningfully.")
 
-    n_pan = int(min(max(n_panels, 1), T_grid.size))
-    idxT = np.unique(np.round(np.linspace(0, T_grid.size - 1, n_pan)).astype(int))
-
-    if (day is not None) and xlim_obs:
-        K_obs = np.asarray(getattr(day, "K_obs"), float).ravel()
-        K_obs = K_obs[np.isfinite(K_obs) & (K_obs > 0)]
-        if K_obs.size > 0:
-            Kmin, Kmax = float(np.nanmin(K_obs)), float(np.nanmax(K_obs))
-        else:
-            Kmin, Kmax = float(K_grid.min()), float(K_grid.max())
-    else:
-        Kmin, Kmax = float(K_grid.min()), float(K_grid.max())
-
-    k_mask = (K_grid >= Kmin) & (K_grid <= Kmax)
-    K_plot = K_grid[k_mask]
-
+    # ----- resolve spot -----
     if spot is None:
         spot = (
             res.get("S0", None)
@@ -352,10 +407,76 @@ def rnd_panels(
             or getattr(day, "spot", None)
         )
     spot = float(spot) if spot is not None else None
-    show_spot = bool(show_spot) and (spot is not None) and (Kmin <= spot <= Kmax)
 
+    x_axis = str(x_axis).strip()
+    if x_axis not in {"K", "R", "r"}:
+        raise ValueError("x_axis must be one of {'K','R','r'}.")
+
+    if x_axis in {"R", "r"} and spot is None:
+        raise ValueError("spot/S0 is required when x_axis is 'R' or 'r'.")
+
+    # ----- choose maturities -----
+    n_pan = int(min(max(n_panels, 1), T_grid.size))
+    idxT = np.unique(np.round(np.linspace(0, T_grid.size - 1, n_pan)).astype(int))
     n_panels_actual = int(idxT.size)
 
+    # ----- determine default K-window (from observed strikes if requested) -----
+    if (day is not None) and xlim_obs:
+        K_obs = np.asarray(getattr(day, "K_obs"), float).ravel()
+        K_obs = K_obs[np.isfinite(K_obs) & (K_obs > 0)]
+        if K_obs.size > 0:
+            Kmin0, Kmax0 = float(np.nanmin(K_obs)), float(np.nanmax(K_obs))
+        else:
+            Kmin0, Kmax0 = float(K_grid.min()), float(K_grid.max())
+    else:
+        Kmin0, Kmax0 = float(K_grid.min()), float(K_grid.max())
+
+    # ----- map bounds in chosen axis back to a K-mask -----
+    # We always mask on K_grid indices, then compute x for plotting.
+    if x_bounds is None:
+        # use default K-window
+        k_mask = (K_grid >= Kmin0) & (K_grid <= Kmax0)
+    else:
+        lo, hi = float(x_bounds[0]), float(x_bounds[1])
+        if lo >= hi:
+            raise ValueError("x_bounds must be (lo, hi) with lo < hi.")
+
+        if x_axis == "K":
+            k_mask = (K_grid >= lo) & (K_grid <= hi)
+        elif x_axis == "R":
+            # R = K/spot => K = R*spot
+            k_mask = (K_grid >= lo * spot) & (K_grid <= hi * spot)
+        else:  # x_axis == "r"
+            # r = log(K/spot) => K = spot*exp(r)
+            k_mask = (K_grid >= spot * np.exp(lo)) & (K_grid <= spot * np.exp(hi))
+
+    # fall back if mask is empty
+    if not np.any(k_mask):
+        raise ValueError("x_bounds produced an empty plotting window on K_grid.")
+
+    K_plot = K_grid[k_mask]
+
+    # ----- compute x for plotting -----
+    if x_axis == "K":
+        x_plot = K_plot
+        xlabel = "Strike K"
+        x_spot = spot
+        show_spot_line = bool(show_spot) and (spot is not None) and (x_plot.min() <= x_spot <= x_plot.max())
+        spot_line_x = x_spot
+    elif x_axis == "R":
+        x_plot = K_plot / spot
+        xlabel = "Gross return R = K/S0"
+        show_spot_line = bool(show_spot)  # spot maps to R=1
+        spot_line_x = 1.0
+        show_spot_line = show_spot_line and (x_plot.min() <= spot_line_x <= x_plot.max())
+    else:  # x_axis == "r"
+        x_plot = np.log(K_plot / spot)
+        xlabel = "Log return r = log(K/S0)"
+        show_spot_line = bool(show_spot)  # spot maps to r=0
+        spot_line_x = 0.0
+        show_spot_line = show_spot_line and (x_plot.min() <= spot_line_x <= x_plot.max())
+
+    # ----- panel shape -----
     if panel_shape is None:
         nrows, ncols = n_panels_actual, 1
     else:
@@ -368,25 +489,30 @@ def rnd_panels(
     fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(fig_w, fig_h), sharex=True)
     axes = np.atleast_1d(axes).ravel()
 
+    # ----- plot -----
     for ax, j in zip(axes[:n_panels_actual], idxT):
-        ax.plot(K_plot, q[j, k_mask], linewidth=2.2, color="tab:blue", label="RND")
+        ax.plot(x_plot, q[j, k_mask], linewidth=2.2, color="tab:blue", label="RND")
 
-        if show_spot:
-            ax.axvline(spot, linestyle="--", linewidth=1.5, color="black", label=spot_label)
+        if show_spot_line:
+            ax.axvline(spot_line_x, linestyle="--", linewidth=1.5, color="black", label=spot_label)
 
         d = f"{date_str} " if date_str else ""
         ax.set_title(f"{d}(T = {float(T_grid[j]):.5g} yr)")
         ax.set_ylabel("q(K|T)")
         ax.grid(True, alpha=0.25)
         ax.legend(loc=legend_loc)
-        ax.set_xlim(Kmin, Kmax)
 
+        # apply x-limits directly in chosen axis units
+        ax.set_xlim(float(x_plot.min()), float(x_plot.max()))
+
+    # turn off unused axes
     for ax in axes[n_panels_actual:]:
         ax.axis("off")
 
-    for ax in axes[(nrows-1)*ncols : nrows*ncols]:
+    # x-label on bottom row
+    for ax in axes[(nrows - 1) * ncols : nrows * ncols]:
         if ax.has_data():
-            ax.set_xlabel("Strike K")
+            ax.set_xlabel(xlabel)
 
     fig.suptitle(title)
     fig.tight_layout()

@@ -29,7 +29,7 @@ class CallSurfaceDay:
 
         m = (
             np.isfinite(self.K_obs) & np.isfinite(self.T_obs) & np.isfinite(self.C_obs) &
-            (self.K_obs > 0) & (self.T_obs > 0) & (self.C_obs >= 0)
+            (self.K_obs > 0) & (self.T_obs >= 0) & (self.C_obs >= 0)
         )
         if not np.all(m):
             object.__setattr__(self, "K_obs", self.K_obs[m])

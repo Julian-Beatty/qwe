@@ -138,7 +138,9 @@ class OptionMarketStandardizer:
         opt_std = opt_std.merge(stock, on="date", how="left")
 
         # compute T / DTE
+        EPS = 2.05e-4  # ~0.000365 days ≈ 2.4 hours 
         opt_std["rounded_maturity"] = yearfrac_act365(opt_std["date"], opt_std["exdate"])
+        opt_std["rounded_maturity"] = opt_std["rounded_maturity"].clip(lower=EPS) # 0 maturity clipped to tiny maturity
         opt_std["T"] = yearfrac_act365(opt_std["date"], opt_std["exdate"])
         opt_std["DTE"] = (pd.to_datetime(opt_std["exdate"]) - pd.to_datetime(opt_std["date"])).dt.days
         opt_std["DTE"] = opt_std["DTE"].clip(lower=1).astype(int)

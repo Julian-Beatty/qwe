@@ -4,48 +4,36 @@ from .eval import evaluate_anchor_surfaces_with_theta_master
 import os
 import numpy as np
 
-
 def plot_kernel_bootstrap_quantiles_panel(
     *,
     anchor_day: dict,
     pk_fit: dict,
     theta_spec,
     eval_spec,
-    j_indices=None,                   # list of maturity indices to plot
-    n_panels: int = 6,                # if j_indices=None, auto-pick this many
+    j_indices=None,
+    n_panels: int = 6,
     panel_shape: tuple[int, int] = (2, 3),
     safety_clip=None,
-    # --- quantile display controls ---
-    q_hi: float = 0.95,               # upper percentile line
-    q_lo: float | None = 0.05,        # lower percentile line (set None to disable)
-    show_q_lines: bool = True,        # if False, draws only the shaded band (if enabled)
-    show_band: bool = True,           # if False, no shading
+    q_hi: float = 0.95,
+    q_lo: float | None = 0.05,
+    show_q_lines: bool = True,
+    show_band: bool = True,
     q_band: tuple[float, float] = (0.025, 0.975),
-    # --- axis/window controls ---
     R_bounds=None,
     r_bounds=None,
     logy: bool = True,
     title: str | None = None,
-    # --- saving controls (like P_Q_K_multipanel) ---
-    save=None,                        # Optional[Union[str, Path]]
+    save=None,
     dpi: int = 200,
+    # ---- NEW ----
+    log_floor: float = 1e-12,
+    auto_ylim: bool = True,
+    ylim_pad: float = 1.15,
 ):
-    """
-    Panel plot of bootstrap pricing-kernel quantiles for multiple maturities
-    on a single anchor date.
-
-    Features added:
-      - optional lower percentile line (q_lo, default 5%)
-      - can turn off both percentile lines and show only shaded band (show_q_lines=False)
-      - saving support via save=... and dpi=... (creates parent dirs, prints path)
-    """
     import numpy as np
     import matplotlib.pyplot as plt
     from pathlib import Path
 
-    # -------------------------
-    # choose maturities
-    # -------------------------
     T_grid = np.asarray(pk_fit["T_grid"], float).ravel()
     nT = T_grid.size
     if nT == 0:
@@ -56,9 +44,6 @@ def plot_kernel_bootstrap_quantiles_panel(
     else:
         j_indices = np.asarray(j_indices, int).ravel()
 
-    # -------------------------
-    # evaluate base (point estimate + grids)
-    # -------------------------
     base = evaluate_anchor_surfaces_with_theta_master(
         anchor_day,
         theta_master=pk_fit["theta_master"],
@@ -72,9 +57,6 @@ def plot_kernel_bootstrap_quantiles_panel(
     if x.size == 0:
         raise ValueError("base['R_common'] is empty.")
 
-    # -------------------------
-    # truncation mask (shared)
-    # -------------------------
     mask = np.isfinite(x)
     if R_bounds is not None:
         Rmin, Rmax = map(float, R_bounds)
@@ -85,19 +67,20 @@ def plot_kernel_bootstrap_quantiles_panel(
 
     xm = x[mask]
 
-    # -------------------------
-    # setup figure
-    # -------------------------
     nrows, ncols = panel_shape
     fig, axes = plt.subplots(
         nrows, ncols,
         figsize=(4.2 * ncols, 3.2 * nrows),
         sharex=True,
-        sharey=True
+        sharey=True,
+        constrained_layout=True,   # <-- fixes label/title clipping
     )
     axes = np.asarray(axes).ravel()
 
     draws_by_T = pk_fit.get("theta_boot_draws_by_T", None)
+
+    # ---- NEW: track global y-lims (after log floor) ----
+    ymins, ymaxs = [], []
 
     for ax, j in zip(axes, j_indices):
         j = int(j)
@@ -107,7 +90,6 @@ def plot_kernel_bootstrap_quantiles_panel(
 
         M_hat = np.asarray(base["anchor_surfaces"]["M_surface"][j], float).ravel()
 
-        # if no bootstrap for this maturity
         if draws_by_T is None or draws_by_T[j] is None:
             ax.set_visible(False)
             continue
@@ -119,7 +101,6 @@ def plot_kernel_bootstrap_quantiles_panel(
 
         B = theta_draws.shape[0]
 
-        # bootstrap evaluation
         M_boot = np.empty((B, x.size), float)
         for b in range(B):
             theta_tmp = np.array(pk_fit["theta_master"], float, copy=True)
@@ -134,7 +115,6 @@ def plot_kernel_bootstrap_quantiles_panel(
             )
             M_boot[b, :] = np.asarray(out_b["anchor_surfaces"]["M_surface"][j], float).ravel()
 
-        # quantiles
         lo_band_q, hi_band_q = float(q_band[0]), float(q_band[1])
         if not (0.0 <= lo_band_q < hi_band_q <= 1.0):
             raise ValueError("q_band must satisfy 0 <= q_band[0] < q_band[1] <= 1.")
@@ -142,67 +122,84 @@ def plot_kernel_bootstrap_quantiles_panel(
         qlo_line = None if q_lo is None else float(q_lo)
         qhi_line = None if q_hi is None else float(q_hi)
 
-        # compute band only if requested
         if show_band:
             lo_band = np.quantile(M_boot, lo_band_q, axis=0)
             hi_band = np.quantile(M_boot, hi_band_q, axis=0)
 
-        # compute quantile lines only if requested
         if show_q_lines:
-            if qhi_line is not None:
-                q_hi_curve = np.quantile(M_boot, qhi_line, axis=0)
-            else:
-                q_hi_curve = None
-            if qlo_line is not None:
-                q_lo_curve = np.quantile(M_boot, qlo_line, axis=0)
-            else:
-                q_lo_curve = None
+            q_hi_curve = np.quantile(M_boot, qhi_line, axis=0) if qhi_line is not None else None
+            q_lo_curve = np.quantile(M_boot, qlo_line, axis=0) if qlo_line is not None else None
 
-        # apply truncation
+        # apply truncation + log-floor
         Mh = M_hat[mask]
+        if logy:
+            Mh = np.maximum(Mh, float(log_floor))
 
-        # plot point estimate
         ax.plot(xm, Mh, linewidth=2.0, label="M (point)")
 
-        # shaded band
         if show_band:
-            ax.fill_between(xm, lo_band[mask], hi_band[mask], alpha=0.25, label="band")
+            lo_m = lo_band[mask]
+            hi_m = hi_band[mask]
+            if logy:
+                lo_m = np.maximum(lo_m, float(log_floor))
+                hi_m = np.maximum(hi_m, float(log_floor))
+            ax.fill_between(xm, lo_m, hi_m, alpha=0.25, label="band")
 
-        # percentile lines
         if show_q_lines:
             if q_hi_curve is not None:
-                ax.plot(xm, q_hi_curve[mask], linewidth=1.8, linestyle="--", label=f"{int(qhi_line*100)}%")
+                qh = q_hi_curve[mask]
+                if logy:
+                    qh = np.maximum(qh, float(log_floor))
+                ax.plot(xm, qh, linewidth=1.8, linestyle="--", label=f"{int(qhi_line*100)}%")
             if q_lo_curve is not None:
-                ax.plot(xm, q_lo_curve[mask], linewidth=1.8, linestyle="--", label=f"{int(qlo_line*100)}%")
+                ql = q_lo_curve[mask]
+                if logy:
+                    ql = np.maximum(ql, float(log_floor))
+                ax.plot(xm, ql, linewidth=1.8, linestyle="--", label=f"{int(qlo_line*100)}%")
 
-        # cosmetics
         ax.set_title(f"T ≈ {T_grid[j]*365:.0f}d")
         if logy:
             ax.set_yscale("log")
 
-    # clean unused axes
+        # track global y-range from what's actually plotted
+        if auto_ylim:
+            ys = []
+            ys.append(Mh)
+            if show_band:
+                ys.append(lo_m); ys.append(hi_m)
+            if show_q_lines:
+                if q_hi_curve is not None: ys.append(qh)
+                if q_lo_curve is not None: ys.append(ql)
+            ycat = np.concatenate([np.asarray(v, float).ravel() for v in ys if v is not None])
+            ycat = ycat[np.isfinite(ycat) & (ycat > 0)]
+            if ycat.size:
+                ymins.append(float(np.min(ycat)))
+                ymaxs.append(float(np.max(ycat)))
+
     used = min(len(j_indices), axes.size)
     for ax in axes[used:]:
         ax.set_visible(False)
 
-    # legend: build only from visible axes
-    legend_ax = None
-    for ax in axes:
-        if ax.get_visible():
-            legend_ax = ax
-            break
+    # set a stable y-limit across panels (prevents “cut off bottom” look)
+    if logy and auto_ylim and len(ymins) and len(ymaxs):
+        ylo = min(ymins)
+        yhi = max(ymaxs)
+        # pad a bit
+        ylo = max(float(log_floor), ylo / float(ylim_pad))
+        yhi = yhi * float(ylim_pad)
+        for ax in axes:
+            if ax.get_visible():
+                ax.set_ylim(ylo, yhi)
 
+    legend_ax = next((ax for ax in axes if ax.get_visible()), None)
     if legend_ax is not None:
         handles, labels = legend_ax.get_legend_handles_labels()
-        # put legend on first visible axis (or globally if you prefer)
         legend_ax.legend(handles, labels, loc="best")
 
     fig.suptitle(title or "Bootstrap pricing kernel quantiles (by maturity)")
     fig.supxlabel("Gross return R")
     fig.supylabel("Pricing kernel M(R)")
-    fig.tight_layout()
 
-    # saving behavior like P_Q_K_multipanel
     if save is not None:
         save = Path(save)
         save.parent.mkdir(parents=True, exist_ok=True)
@@ -211,6 +208,7 @@ def plot_kernel_bootstrap_quantiles_panel(
 
     plt.show()
     return fig
+
 
 
 def _slice_bounds_2d(
@@ -255,121 +253,121 @@ def _maybe_save_matplotlib(fig, save: str | None, dpi: int = 200):
     print(f"[saved] {save}")
 
 
-def physical_density_surface_plot(
-    out: dict,
-    *,
-    title: str = "Physical Density Surface",
-    cmap: str = "viridis",          # plotly colorscale name OR matplotlib cmap name
-    save: str | None = None,        # .html (plotly) OR .png/.pdf/etc (mpl or plotly)
-    interactive: bool = True,
-    show: bool = True,
-    R_bounds: tuple[float, float] | None = None,
-    T_bounds: tuple[float, float] | None = None,
-    dpi: int = 200,
-):
-    """
-    Plot physical density surface p(R|T).
+# def physical_density_surface_plot(
+#     out: dict,
+#     *,
+#     title: str = "Physical Density Surface",
+#     cmap: str = "viridis",          # plotly colorscale name OR matplotlib cmap name
+#     save: str | None = None,        # .html (plotly) OR .png/.pdf/etc (mpl or plotly)
+#     interactive: bool = True,
+#     show: bool = True,
+#     R_bounds: tuple[float, float] | None = None,
+#     T_bounds: tuple[float, float] | None = None,
+#     dpi: int = 200,
+# ):
+#     """
+#     Plot physical density surface p(R|T).
 
-    Requires (in `out`):
-      out["anchor_surfaces"]["pR_surface"]
-      out["R_common"]
-      out["T_anchor"]
+#     Requires (in `out`):
+#       out["anchor_surfaces"]["pR_surface"]
+#       out["R_common"]
+#       out["T_anchor"]
 
-    interactive=True  -> Plotly 3D surface
-    interactive=False -> Matplotlib 3D surface
-    """
+#     interactive=True  -> Plotly 3D surface
+#     interactive=False -> Matplotlib 3D surface
+#     """
 
-    anchor = out.get("anchor_surfaces", None)
-    if anchor is None or "pR_surface" not in anchor:
-        raise KeyError("Expected out['anchor_surfaces']['pR_surface'].")
+#     anchor = out.get("anchor_surfaces", None)
+#     if anchor is None or "pR_surface" not in anchor:
+#         raise KeyError("Expected out['anchor_surfaces']['pR_surface'].")
 
-    p = np.asarray(anchor["pR_surface"], float)
-    R_grid = np.asarray(out.get("R_common", []), float).ravel()
-    T_grid = np.asarray(out.get("T_anchor", []), float).ravel()
+#     p = np.asarray(anchor["pR_surface"], float)
+#     R_grid = np.asarray(out.get("R_common", []), float).ravel()
+#     T_grid = np.asarray(out.get("T_anchor", []), float).ravel()
 
-    if R_grid.size == 0 or T_grid.size == 0:
-        raise KeyError("Expected out['R_common'] and out['T_anchor'].")
+#     if R_grid.size == 0 or T_grid.size == 0:
+#         raise KeyError("Expected out['R_common'] and out['T_anchor'].")
 
-    if p.shape != (T_grid.size, R_grid.size):
-        raise ValueError("pR_surface must have shape (len(T_anchor), len(R_common)).")
+#     if p.shape != (T_grid.size, R_grid.size):
+#         raise ValueError("pR_surface must have shape (len(T_anchor), len(R_common)).")
 
-    T_plot, R_plot, p_plot = _slice_bounds_2d(T_grid, R_grid, p, T_bounds=T_bounds, R_bounds=R_bounds)
-    if T_plot.size < 2 or R_plot.size < 2:
-        raise ValueError("Not enough points to plot after applying bounds.")
+#     T_plot, R_plot, p_plot = _slice_bounds_2d(T_grid, R_grid, p, T_bounds=T_bounds, R_bounds=R_bounds)
+#     if T_plot.size < 2 or R_plot.size < 2:
+#         raise ValueError("Not enough points to plot after applying bounds.")
 
-    date_label = out.get("anchor_key_used", out.get("anchor_date_used", ""))
-    plot_title = f"{title} — {date_label}" if date_label else title
+#     date_label = out.get("anchor_key_used", out.get("anchor_date_used", ""))
+#     plot_title = f"{title} — {date_label}" if date_label else title
 
-    # -------------------- Matplotlib branch --------------------
-    if not interactive:
-        import matplotlib.pyplot as plt
-        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+#     # -------------------- Matplotlib branch --------------------
+#     if not interactive:
+#         import matplotlib.pyplot as plt
+#         from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-        R_mesh, T_mesh = np.meshgrid(R_plot, T_plot)
+#         R_mesh, T_mesh = np.meshgrid(R_plot, T_plot)
 
-        fig = plt.figure(figsize=(9.5, 6.5))
-        ax = fig.add_subplot(111, projection="3d")
-        surf = ax.plot_surface(R_mesh, T_mesh, p_plot, cmap=cmap, linewidth=0, antialiased=True)
+#         fig = plt.figure(figsize=(9.5, 6.5))
+#         ax = fig.add_subplot(111, projection="3d")
+#         surf = ax.plot_surface(R_mesh, T_mesh, p_plot, cmap=cmap, linewidth=0, antialiased=True)
 
-        ax.set_title(plot_title)
-        ax.set_xlabel("Gross return R")
-        ax.set_ylabel("Maturity T (years)")
-        ax.set_zlabel("p(R|T)")
+#         ax.set_title(plot_title)
+#         ax.set_xlabel("Gross return R")
+#         ax.set_ylabel("Maturity T (years)")
+#         ax.set_zlabel("p(R|T)")
 
-        cbar = fig.colorbar(surf, ax=ax, shrink=0.65, pad=0.08)
-        cbar.set_label("p(R)")
+#         cbar = fig.colorbar(surf, ax=ax, shrink=0.65, pad=0.08)
+#         cbar.set_label("p(R)")
 
-        fig.tight_layout()
-        _maybe_save_matplotlib(fig, save, dpi=dpi)
+#         fig.tight_layout()
+#         _maybe_save_matplotlib(fig, save, dpi=dpi)
 
-        if show:
-            plt.show()
-        return fig
+#         if show:
+#             plt.show()
+#         return fig
 
-    # -------------------- Plotly branch --------------------
-    import plotly.graph_objects as go
+#     # -------------------- Plotly branch --------------------
+#     import plotly.graph_objects as go
 
-    R_mesh, T_mesh = np.meshgrid(R_plot, T_plot)
+#     R_mesh, T_mesh = np.meshgrid(R_plot, T_plot)
 
-    fig = go.Figure(
-        data=[
-            go.Surface(
-                x=R_mesh,
-                y=T_mesh,
-                z=p_plot,
-                colorscale=cmap,
-                colorbar=dict(title="p(R)"),
-            )
-        ]
-    )
+#     fig = go.Figure(
+#         data=[
+#             go.Surface(
+#                 x=R_mesh,
+#                 y=T_mesh,
+#                 z=p_plot,
+#                 colorscale=cmap,
+#                 colorbar=dict(title="p(R)"),
+#             )
+#         ]
+#     )
 
-    fig.update_layout(
-        title=plot_title,
-        scene=dict(
-            xaxis_title="Gross return R",
-            yaxis_title="Maturity T (years)",
-            zaxis_title="p(R|T)",
-        ),
-        margin=dict(l=0, r=0, t=50, b=0),
-    )
+#     fig.update_layout(
+#         title=plot_title,
+#         scene=dict(
+#             xaxis_title="Gross return R",
+#             yaxis_title="Maturity T (years)",
+#             zaxis_title="p(R|T)",
+#         ),
+#         margin=dict(l=0, r=0, t=50, b=0),
+#     )
 
-    if save is not None:
-        save = str(save)
-        folder = os.path.dirname(save) or "."
-        os.makedirs(folder, exist_ok=True)
+#     if save is not None:
+#         save = str(save)
+#         folder = os.path.dirname(save) or "."
+#         os.makedirs(folder, exist_ok=True)
 
-        if save.lower().endswith(".html"):
-            fig.write_html(save)
-            print(f"[saved] {save}")
-        else:
-            # Image export: requires `pip install -U kaleido`
-            fig.write_image(save)
-            print(f"[saved] {save}")
+#         if save.lower().endswith(".html"):
+#             fig.write_html(save)
+#             print(f"[saved] {save}")
+#         else:
+#             # Image export: requires `pip install -U kaleido`
+#             fig.write_image(save)
+#             print(f"[saved] {save}")
 
-    if show:
-        fig.show()
+#     if show:
+#         fig.show()
 
-    return fig
+#     return fig
 
 
 def rra_surface_plot(
@@ -617,67 +615,287 @@ def _maybe_save(fig, save: Optional[Union[str, Path]], dpi: int):
 # Panels: Physical density
 # ----------------------------
 
+def physical_density_surface_plot(
+    out: dict,
+    *,
+    title: str = "Physical Density Surface",
+    cmap: str = "viridis",
+    save: str | None = None,
+    interactive: bool = True,
+    show: bool = True,
+    space: str = "gross",                 # "gross" | "log" | "strike"
+    x_bounds: tuple[float, float] | None = None,
+    R_bounds: tuple[float, float] | None = None,   # backward compat: treated as x_bounds if provided
+    T_bounds: tuple[float, float] | None = None,
+    dpi: int = 200,
+):
+    """
+    Plot physical density surface in one of three spaces:
+
+      space="gross"  -> p(R|T)  using out["anchor_surfaces"]["pR_surface"] and out["R_common"]
+      space="log"    -> f_P(r|T) using out["anchor_surfaces"]["fP_r_surface"] and out["r_common"]
+      space="strike" -> p(K|T)  using out["anchor_surfaces"]["pK_surface"] and out["K_common"]
+
+    Requires:
+      out["T_anchor"]
+      and the corresponding surface/grid depending on `space`.
+
+    interactive=True  -> Plotly 3D surface (if you have that branch elsewhere)
+    interactive=False -> Matplotlib 3D surface
+    """
+    import numpy as np
+
+    anchor = out.get("anchor_surfaces", None)
+    if anchor is None:
+        raise KeyError("Expected out['anchor_surfaces'].")
+
+    # --- backward compatibility ---
+    if x_bounds is None and R_bounds is not None:
+        x_bounds = R_bounds
+
+    space = str(space).lower().strip()
+
+    if space in ("gross", "r", "return", "returns"):
+        surf_key = "pR_surface"
+        x_key = "R_common"
+        x_label = "Gross return R"
+        z_label = "p(R|T)"
+        default_title = "Physical Density Surface (Gross Return)"
+    elif space in ("log", "lr", "logreturn", "log_return", "rlog"):
+        surf_key = "fP_r_surface"
+        x_key = "r_common"
+        x_label = "Log return r = log(S_T/S0)"
+        z_label = "f_P(r|T)"
+        default_title = "Physical Density Surface (Log Return)"
+    elif space in ("strike", "k", "price", "spot"):
+        surf_key = "pK_surface"
+        x_key = "K_common"
+        x_label = "Strike / terminal price K (S_T)"
+        z_label = "p(K|T)"
+        default_title = "Physical Density Surface (Strike)"
+    else:
+        raise ValueError("space must be one of: 'gross', 'log', 'strike'")
+
+    if surf_key not in anchor:
+        raise KeyError(f"Expected out['anchor_surfaces']['{surf_key}'].")
+
+    p = np.asarray(anchor[surf_key], float)
+    X_grid = np.asarray(out.get(x_key, []), float).ravel()
+    T_grid = np.asarray(out.get("T_anchor", []), float).ravel()
+
+    if X_grid.size == 0 or T_grid.size == 0:
+        raise KeyError(f"Expected out['{x_key}'] and out['T_anchor'].")
+
+    if p.shape != (T_grid.size, X_grid.size):
+        raise ValueError(f"{surf_key} must have shape (len(T_anchor), len({x_key})).")
+
+    # Slice bounds using your helper; it expects names T_bounds and R_bounds,
+    # so we pass x-bounds via R_bounds param.
+    T_plot, X_plot, p_plot = _slice_bounds_2d(
+        T_grid, X_grid, p,
+        T_bounds=T_bounds,
+        R_bounds=x_bounds,
+    )
+    if T_plot.size < 2 or X_plot.size < 2:
+        raise ValueError("Not enough points to plot after applying bounds.")
+
+    date_label = out.get("anchor_key_used", out.get("anchor_date_used", ""))
+    base_title = title if title else default_title
+    plot_title = f"{base_title} — {date_label}" if date_label else base_title
+
+    # -------------------- Matplotlib branch --------------------
+    if not interactive:
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+        X_mesh, T_mesh = np.meshgrid(X_plot, T_plot)
+
+        fig = plt.figure(figsize=(9.5, 6.5))
+        ax = fig.add_subplot(111, projection="3d")
+        surf = ax.plot_surface(X_mesh, T_mesh, p_plot, cmap=cmap, linewidth=0, antialiased=True)
+
+        ax.set_title(plot_title)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Maturity T (years)")
+        ax.set_zlabel(z_label)
+
+        cbar = fig.colorbar(surf, ax=ax, shrink=0.65, pad=0.08)
+        cbar.set_label(z_label)
+
+        fig.tight_layout()
+        _maybe_save_matplotlib(fig, save, dpi=dpi)
+
+        if show:
+            plt.show()
+        return fig
+
+    # -------------------- Plotly branch --------------------
+    # If you already have a plotly surface helper, plug it in here.
+    # Keeping minimal: implement locally if needed.
+    import plotly.graph_objects as go
+
+    X_mesh, T_mesh = np.meshgrid(X_plot, T_plot)
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                x=X_mesh,
+                y=T_mesh,
+                z=p_plot,
+                colorscale=cmap,
+                showscale=True,
+                colorbar=dict(title=z_label),
+            )
+        ]
+    )
+    fig.update_layout(
+        title=plot_title,
+        scene=dict(
+            xaxis_title=x_label,
+            yaxis_title="Maturity T (years)",
+            zaxis_title=z_label,
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+
+    # Save (html recommended for plotly)
+    if save:
+        if save.lower().endswith(".html"):
+            fig.write_html(save)
+        else:
+            # requires kaleido installed for static images
+            fig.write_image(save, scale=2)
+
+    if show:
+        fig.show()
+
+    return fig
+
 def physical_density_panels(
     out: dict,
     *,
     n_panels: int = 6,
     title: str = "Physical Density Panels",
     date_str: Optional[str] = None,
-    R_bounds: Optional[Tuple[float, float]] = None,
-    # optional vertical line at R=1
-    show_R1: bool = True,
-    R1_label: str = "R=1",
+    space: str = "gross",                          # "gross" | "log" | "strike"
+    x_bounds: Optional[Tuple[float, float]] = None,
+    R_bounds: Optional[Tuple[float, float]] = None,  # backward compat alias for x_bounds
+    # optional vertical reference line (space-dependent)
+    show_ref: bool = True,
+    ref_label: Optional[str] = None,
     save: Optional[Union[str, Path]] = None,
     dpi: int = 200,
     legend_loc: str = "upper right",
     figsize_per_panel: float = 2.2,
 ):
     """
-    Stacked panels for physical density p(R|T).
+    Stacked panels for physical density in different spaces.
 
-    Requires:
-      out["anchor_surfaces"]["pR_surface"], out["R_common"], out["T_anchor"]
+    Requires (depending on `space`):
+      space="gross":  out["anchor_surfaces"]["pR_surface"], out["R_common"], out["T_anchor"]
+      space="log":    out["anchor_surfaces"]["fP_r_surface"], out["r_common"], out["T_anchor"]
+      space="strike": out["anchor_surfaces"]["pK_surface"], out["K_common"], out["T_anchor"]
     """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # --- backward compatibility ---
+    if x_bounds is None and R_bounds is not None:
+        x_bounds = R_bounds
+
     anchor = out.get("anchor_surfaces", {})
-    if "pR_surface" not in anchor:
-        raise KeyError("Expected out['anchor_surfaces']['pR_surface'].")
+    T = np.asarray(out.get("T_anchor", []), float).ravel()
+    if T.size == 0:
+        raise KeyError("Expected out['T_anchor'].")
 
-    R, T = _get_pk_grids(out)
-    p = np.asarray(anchor["pR_surface"], float)
+    space = str(space).lower().strip()
 
-    # Optional R bounds (panels only; all Ts kept)
-    if R_bounds is not None:
-        R2, T2, p2, _, _ = _slice_RT(R, T, p, R_bounds=R_bounds, T_bounds=None)
+    # --- select surface + grid + labels ---
+    if space in ("gross", "r", "return", "returns"):
+        surf_key = "pR_surface"
+        grid_key = "R_common"
+        curve_label = "p(R|T)"
+        x_label = "Gross return R"
+        y_label = "p(R|T)"
+        ref_x = 1.0
+        default_ref_label = "R=1"
+    elif space in ("log", "lr", "logreturn", "log_return"):
+        surf_key = "fP_r_surface"
+        grid_key = "r_common"
+        curve_label = "f_P(r|T)"
+        x_label = "Log return r = log(S_T/S0)"
+        y_label = "f_P(r|T)"
+        ref_x = 0.0
+        default_ref_label = "r=0"
+    elif space in ("strike", "k", "price"):
+        surf_key = "pK_surface"
+        grid_key = "K_common"
+        curve_label = "p(K|T)"
+        x_label = "Strike / terminal price K (S_T)"
+        y_label = "p(K|T)"
+        ref_x = float(out.get("meta", {}).get("S0", out.get("S0", np.nan)))
+        default_ref_label = "K=S0"
+        if not np.isfinite(ref_x):
+            # if S0 not present, disable ref line automatically
+            ref_x = None
     else:
-        R2, T2, p2 = R, T, p
+        raise ValueError("space must be one of: 'gross', 'log', 'strike'")
 
+    if surf_key not in anchor:
+        raise KeyError(f"Expected out['anchor_surfaces']['{surf_key}'].")
+
+    X = np.asarray(out.get(grid_key, []), float).ravel()
+    if X.size == 0:
+        raise KeyError(f"Expected out['{grid_key}'].")
+
+    p = np.asarray(anchor[surf_key], float)
+    if p.shape != (T.size, X.size):
+        raise ValueError(f"{surf_key} must have shape (len(T_anchor), len({grid_key})).")
+
+    # --- apply x-bounds (keep all T) ---
+    if x_bounds is not None:
+        lo, hi = float(x_bounds[0]), float(x_bounds[1])
+        if lo >= hi:
+            raise ValueError("x_bounds must satisfy (lo < hi).")
+        mX = (X >= lo) & (X <= hi)
+        X2 = X[mX]
+        p2 = p[:, mX]
+        T2 = T
+    else:
+        X2, T2, p2 = X, T, p
+
+    if X2.size < 2 or T2.size < 1:
+        raise ValueError("Not enough points to plot after applying bounds.")
+
+    # choose maturity indices
     idxT = _pick_panel_indices(T2, n_panels)
-
-    # Figure
     nrows = idxT.size
+
+    # figure
     fig_h = max(4.0, figsize_per_panel * nrows)
     fig, axes = plt.subplots(nrows=nrows, ncols=1, figsize=(8.5, fig_h), sharex=True)
     if nrows == 1:
         axes = np.array([axes])
 
-    # R=1 line visibility based on bounds
-    show_R1_eff = bool(show_R1) and (R2[0] <= 1.0 <= R2[-1])
+    # reference line visibility
+    ref_label_eff = ref_label if ref_label is not None else default_ref_label
+    show_ref_eff = bool(show_ref) and (ref_x is not None) and np.isfinite(ref_x) and (X2[0] <= ref_x <= X2[-1])
 
     for ax, j in zip(axes, idxT):
         y = np.asarray(p2[j, :], float)
-        m = np.isfinite(R2) & np.isfinite(y)
-        ax.plot(R2[m], y[m], linewidth=2.2, label="p(R|T)")
+        m = np.isfinite(X2) & np.isfinite(y)
 
-        if show_R1_eff:
-            ax.axvline(1.0, linestyle="--", linewidth=1.5, color="black", label=R1_label)
+        ax.plot(X2[m], y[m], linewidth=2.2, label=curve_label)
+
+        if show_ref_eff:
+            ax.axvline(float(ref_x), linestyle="--", linewidth=1.5, color="black", label=ref_label_eff)
 
         d = f"{date_str} " if date_str else ""
         ax.set_title(f"{d}(T = {float(T2[j]):.5g} yr)")
-        ax.set_ylabel("p(R|T)")
+        ax.set_ylabel(y_label)
         ax.grid(True, alpha=0.25)
         ax.legend(loc=legend_loc)
 
-    axes[-1].set_xlabel("Gross return R")
+    axes[-1].set_xlabel(x_label)
     fig.suptitle(title)
     fig.tight_layout()
     _maybe_save(fig, save, dpi=dpi)
